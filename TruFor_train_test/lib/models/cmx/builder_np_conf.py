@@ -19,7 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 
-from lib.models.cmx.init_func import init_weight
+from models.TruFor.TruFor_train_test.lib.models.cmx.init_func import init_weight
 
 import logging
 
@@ -133,7 +133,7 @@ class EncoderDecoder(nn.Module):
             raise NotImplementedError('Decoder not implemented')
 
         # Noiseprint++ extractor
-        from lib.models.DnCNN import make_net
+        from models.TruFor.TruFor_train_test.lib.models.DnCNN import make_net
         num_levels = 17
         out_channel = self.np_out_ch
         self.dncnn = make_net(3, kernels=[3, ] * num_levels,

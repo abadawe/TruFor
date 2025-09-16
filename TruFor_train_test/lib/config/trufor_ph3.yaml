@@ -48,3 +48,5 @@ VALID:
   MAX_SIZE: 2048
   BEST_KEY: 'avg_det_bacc'
   AUG: 'lib/config/aug_res_comp.yaml'
+TEST:
+  MODEL_FILE: 'pretrained_models/trufor/trufor.pth.tar'

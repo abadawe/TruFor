@@ -127,3 +127,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# TruFor weights
+TruFor_train_test/pretrained_models/trufor/*.pth.tar
