@@ -1,107 +1,124 @@
+# backend/models/TruFor/TruFor_train_test/dataset/CustomTestDataset.py
+
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple, Union, Optional
 import io
-import random
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, Callable
 
-import numpy as np
+from PIL import Image
 import torch
 from torch.utils.data import Dataset
-from PIL import Image
+import torchvision.transforms.functional as TF
 
-ImageInput = Union[
-    Dict[str, Any],      # {"name": str, "bytes": bytes}  OR {"path": str}
-    Tuple[str, bytes],   # (name, bytes)
-    bytes,               # raw image bytes
-    str,                 # file path
-    Path,                # file path
-    Image.Image,         # PIL image (uses .filename if present)
-]
+# Type accepted for each item in list_img:
+# - dict with {'name','bytes'}                         (eager in-memory bytes)
+# - dict with {'name','s3_key'} + resolver callable    (lazy; bytes fetched on demand)
+# - dict with {'path'} or {'filepath'}                 (local file path)
+# - Path or str (treated as a local file path)
+ImageInput = Union[Dict[str, Any], str, Path]
+
+
+def _pil_to_rgb_tensor(img: Image.Image) -> torch.Tensor:
+    """
+    Convert PIL image to float32 RGB tensor in CHW with values in [0, 1].
+    DataLoader with batch_size=1 will wrap this to [1, 3, H, W].
+    """
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    t = TF.to_tensor(img)  # -> FloatTensor [3, H, W], range [0,1]
+    return t
 
 
 class CustomTestDataset(Dataset):
     """
-    Accepts a heterogeneous list of image items:
-      - {"name": str, "bytes": bytes}
-      - {"path": str|Path}
-      - (name, bytes)
-      - bytes
-      - str|Path  (file path)
-      - PIL.Image.Image
+    Minimal dataset used by TruFor test-time inference.
 
-    Returns:
-      (C,H,W) float32 tensor in [0,1], filename (str)
+    Yields:
+        (rgb_tensor: FloatTensor[C, H, W], name: str)
+
+    Supports items shaped as:
+      - {'name': str, 'bytes': bytes}
+      - {'name': str, 's3_key': str}  (requires resolver to be provided)
+      - {'path': str | Path} or {'filepath': str | Path}
+      - Path or str (treated as file path)
     """
 
-    def __init__(self, list_img: Optional[Iterable[ImageInput]] = None):
+    def __init__(
+        self,
+        list_img: Optional[Iterable[ImageInput]] = None,
+        *,
+        resolver: Optional[Callable[[Dict[str, Any]], bytes]] = None,
+    ):
+        """
+        Args:
+            list_img: Iterable of image descriptors (see supported shapes above).
+            resolver: Optional callable that converts a dict item containing a
+                      lazy reference (e.g., {'name','s3_key'}) into raw bytes.
+                      Signature: resolver(item_dict) -> bytes
+        """
         self.img_list: List[ImageInput] = list(list_img or [])
-
-    def shuffle(self) -> None:
-        if self.img_list:
-            random.shuffle(self.img_list)
+        self.resolver = resolver
 
     def __len__(self) -> int:
         return len(self.img_list)
 
-    def __getitem__(self, index: int):
-        assert self.img_list, "Empty dataset"
-        assert 0 <= index < len(self.img_list), f"Index {index} is not available!"
-
-        item = self.img_list[index]
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str]:
+        item = self.img_list[idx]
         pil_img, name = self._to_pil_and_name(item)
-        pil_img = pil_img.convert("RGB")
+        rgb = _pil_to_rgb_tensor(pil_img)
+        return rgb, name
 
-        # (H, W, C) -> (C, H, W), float32 in [0, 1]
-        arr = np.array(pil_img, dtype=np.uint8)
-        tensor = torch.from_numpy(arr).permute(2, 0, 1).to(torch.float32) / 255.0
+    # ---- Internal helpers -------------------------------------------------
 
-        return tensor, name
-
-    # --------------------------
-    # Helpers
-    # --------------------------
     def _to_pil_and_name(self, item: ImageInput) -> Tuple[Image.Image, str]:
-        # dict cases
+        # dict cases first
         if isinstance(item, dict):
+            # 1) {'name','bytes'} — allow None bytes to fall back to resolver
             if "bytes" in item:
                 name = str(item.get("name") or "image")
-                return Image.open(io.BytesIO(item["bytes"])), name
+                data = item.get("bytes", None)
+                if data is None and self.resolver is not None:
+                    data = self.resolver(item)
+                if data is None:
+                    raise ValueError(
+                        "Item had 'bytes' key but the value was None and no resolver "
+                        "was provided to recover the bytes."
+                    )
+                return Image.open(io.BytesIO(data)), name
+
+            # 2) {'name','s3_key'} — requires resolver
+            if "s3_key" in item:
+                if self.resolver is None:
+                    raise ValueError(
+                        "Encountered item with 's3_key' but no resolver was provided. "
+                        "Pass resolver=... when constructing CustomTestDataset."
+                    )
+                name = str(item.get("name") or item["s3_key"] or "image")
+                data = self.resolver(item)
+                return Image.open(io.BytesIO(data)), name
+
+            # 3) {'path'} / {'filepath'}
             if "path" in item:
                 path = Path(item["path"])
                 return Image.open(path), path.name
             if "filepath" in item:
                 path = Path(item["filepath"])
                 return Image.open(path), path.name
-            raise ValueError("Unsupported dict format. Expected keys: {'name','bytes'} or {'path'}.")
 
-        # tuple(name, bytes)
-        if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str) and isinstance(item[1], (bytes, bytearray)):
-            return Image.open(io.BytesIO(item[1])), item[0]
+            # Unsupported dict shape
+            raise ValueError(
+                "Unsupported dict format. Expected one of: "
+                "{'name','bytes' (not None)}, {'path'}, or {'name','s3_key'} with a resolver."
+            )
 
-        # raw bytes
-        if isinstance(item, (bytes, bytearray)):
-            return Image.open(io.BytesIO(item)), "image"
-
-        # path-like
+        # path-like cases
         if isinstance(item, (str, Path)):
             p = Path(item)
             return Image.open(p), p.name
 
-        # PIL.Image
-        if isinstance(item, Image.Image):
-            name = getattr(item, "filename", None)
-            name = Path(name).name if name else "image"
-            return item, name
-
-        # Fallback: try file-like objects
-        if hasattr(item, "read"):
-            # file-like object with .read()
-            data = item.read()
-            return Image.open(io.BytesIO(data)), "image"
-
-        raise TypeError(f"Unsupported image item type: {type(item)}")
-
-    def get_filename(self, index: int) -> str:
-        _, name = self.__getitem__(index)
-        return name
+        # Fallback
+        raise TypeError(
+            f"Unsupported item type {type(item)}. "
+            "Expected dict with {'name','bytes'} / {'name','s3_key'} / {'path'}, or a path-like."
+        )
